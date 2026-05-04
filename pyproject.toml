@@ -1,0 +1,14 @@
+[project]
+name = "sigma-server"
+version = "0.1.0"
+description = "AI inference server for SIGMA — deploy on a GPU machine"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "nibabel>=5.2",
+    "numpy>=1.26",
+    "torch>=2.0",
+    "TotalSegmentator>=2.0",
+    "httpx>=0.27",
+]
