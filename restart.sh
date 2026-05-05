@@ -15,5 +15,5 @@ fi
 
 echo "Starting SigmaServer on port $PORT …"
 cd "$SCRIPT_DIR"
-"/Users/bje/repos/Sigma/server/.venv/bin/python" -u server.py --port "$PORT" &
+"$SCRIPT_DIR/.venv/bin/python" -u server.py --port "$PORT" &
 echo "SigmaServer started (PID $!)"

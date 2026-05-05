@@ -11,4 +11,6 @@ dependencies = [
     "torch>=2.0",
     "TotalSegmentator>=2.0",
     "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "monai>=1.3",
 ]

@@ -17,6 +17,7 @@ config.json: { "ai": { "server": "http://<this-machine>:8050" } }
 
 import argparse
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -194,6 +195,103 @@ _RUNNER_FACTORIES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Built-in models (always available, no user registration required)
+# ---------------------------------------------------------------------------
+
+def _totalsegmentator_device() -> tuple[str, bool]:
+    """Return (device, use_fast) suited to the current platform.
+
+    macOS: MPS when available (Apple Silicon), else CPU; always fast=True because
+    MPS/CPU can't run the 1.5 mm model in reasonable time.
+    Other: gpu when CUDA is available, else CPU; fast=False (full 1.5 mm model).
+    """
+    import torch
+    if sys.platform == "darwin":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        return device, True
+    device = "gpu" if torch.cuda.is_available() else "cpu"
+    return device, False
+
+
+def _label_color(idx: int) -> dict:
+    import colorsys
+    hue = (idx * 0.618033988749895) % 1.0  # golden-ratio spread
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.75, 0.90)
+    return {"r": int(r * 255), "g": int(g * 255), "b": int(b * 255)}
+
+
+def _get_totalsegmentator_labels(task: str) -> list[dict]:
+    """Return [{value, name, color}] label objects for each non-background class."""
+    try:
+        from totalsegmentator.map_to_binary import class_map
+        mapping: dict[int, str] = class_map.get(task, {})
+        if not mapping:
+            return []
+        return [
+            {"value": idx, "name": name, "color": _label_color(idx)}
+            for idx, name in sorted(mapping.items())
+        ]
+    except Exception:
+        return []
+
+
+def _make_totalsegmentator_runner(task: str):
+    from totalsegmentator.python_api import totalsegmentator as _ts
+    device, use_fast = _totalsegmentator_device()
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+        input_img = nib.load(str(input_path))
+        output_img = _ts(input_img, task=task, ml=True, verbose=False,
+                         device=device, fast=use_fast)
+        out_path = output_dir / "prediction.nii.gz"
+        nib.save(output_img, str(out_path))
+        return out_path, _get_totalsegmentator_labels(task)
+
+    return run
+
+
+_BUILTIN_MODELS = [
+    {
+        "id": "totalsegmentator",
+        "name": "TotalSegmentator",
+        "description": "Segmentation of 117 anatomical structures in CT images.",
+        "modality": ["CT"],
+        "task": "total",
+    },
+    {
+        "id": "totalsegmentator_mr",
+        "name": "TotalSegmentator MR",
+        "description": "Segmentation of 50 anatomical structures in MR images.",
+        "modality": ["MR"],
+        "task": "total_mr",
+    },
+]
+
+
+def load_builtin_models() -> None:
+    """Register built-in runners that are always available regardless of the registry."""
+    for spec in _BUILTIN_MODELS:
+        model_id = spec["id"]
+        try:
+            runner = _make_totalsegmentator_runner(spec["task"])
+        except Exception as e:
+            print(f"[builtin] {model_id} unavailable: {e}")
+            continue
+        _runners[model_id] = runner
+        _model_meta[model_id] = {
+            "id": model_id,
+            "name": spec["name"],
+            "description": spec["description"],
+            "modality": spec["modality"],
+            "endpoint": "/predict",
+            "weights": model_id,
+            "accepts_labels": False,
+            "labels": [],
+        }
+        print(f"[builtin] Loaded '{model_id}'")
+
+
 def load_registered_models() -> None:
     """Read models_registry.json and register each entry into _runners / _model_meta."""
     if not REGISTRY_FILE.exists():
@@ -315,6 +413,7 @@ async def predict(
 @app.post("/models/reload")
 async def reload_models():
     """Re-read models_registry.json and load any newly registered models."""
+    load_builtin_models()
     load_registered_models()
     return {"loaded": list(_runners.keys())}
 
@@ -324,12 +423,18 @@ async def health():
     """Health check — reports GPU status and available models."""
     try:
         import torch
-        gpu_available = torch.cuda.is_available()
-        gpu_name = torch.cuda.get_device_name(0) if gpu_available else "none"
-        gpu_mem = (
-            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
-            if gpu_available else "n/a"
-        )
+        if torch.cuda.is_available():
+            gpu_available = True
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
+        elif torch.backends.mps.is_available():
+            gpu_available = True
+            gpu_name = "Apple MPS"
+            gpu_mem = "n/a"
+        else:
+            gpu_available = False
+            gpu_name = "none"
+            gpu_mem = "n/a"
     except ImportError:
         gpu_available = False
         gpu_name = "none"
@@ -350,11 +455,18 @@ async def health():
 
 
 def main():
+    import os
+    # Allow TotalSegmentator weight downloads through corporate TLS proxies (e.g. Zscaler).
+    # requests/urllib3 honour REQUESTS_CA_BUNDLE; SSL_CERT_FILE is set by many corp environments.
+    if ssl_cert := os.environ.get("SSL_CERT_FILE"):
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ssl_cert)
+
     parser = argparse.ArgumentParser(description="SigmaServer — AI Inference")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
 
+    load_builtin_models()
     load_registered_models()
     print(f"Registered models: {[m['id'] for m in _model_meta.values()]}")
     print(f"Starting SigmaServer on http://{args.host}:{args.port}")
