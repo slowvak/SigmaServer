@@ -9,15 +9,14 @@ Endpoints:
     GET  /health         — health check + GPU info
 
 Usage:
-    python server.py [--host 0.0.0.0] [--port 8080]
+    python server.py [--host 0.0.0.0] [--port 8050]
 
 SIGMA image server discovers this server via the "ai.server" field in
-config.json: { "ai": { "server": "http://<this-machine>:8080" } }
+config.json: { "ai": { "server": "http://<this-machine>:8050" } }
 """
 
 import argparse
 import json
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -26,6 +25,10 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import Response
+
+REGISTRY_FILE = Path(__file__).parent / "models_registry.json"
+_registry_model_ids: set[str] = set()
+_registry_active: bool = False  # True once registry file with entries is found
 
 app = FastAPI(title="SigmaServer — AI Inference")
 
@@ -36,173 +39,203 @@ _runners: dict[str, callable] = {}
 _model_meta: dict[str, dict] = {}
 
 
-def register_model(
-    weights_name: str,
-    *,
-    id: str,
-    name: str,
-    description: str,
-    modality: list[str],
-    accepts_labels: bool = False,
-):
-    """Decorator that registers a model runner function with full metadata."""
-    def decorator(fn):
-        _runners[weights_name] = fn
-        _model_meta[weights_name] = {
-            "id": id,
-            "name": name,
-            "description": description,
-            "modality": modality,
+
+
+# ---------------------------------------------------------------------------
+# Registry-based model loading (AddModel.py writes models_registry.json)
+# ---------------------------------------------------------------------------
+
+def _make_onnx_runner(model_path: str, model_info: dict):
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(
+        model_path,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    input_name = session.get_inputs()[0].name
+    n_outputs = session.get_outputs()[0].shape[1] if session.get_outputs()[0].shape else 1
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+        img = nib.load(str(input_path))
+        data = np.asarray(img.dataobj, dtype=np.float32)
+        lo, hi = data.min(), data.max()
+        data = (data - lo) / (hi - lo + 1e-8)
+        x = data[np.newaxis, np.newaxis]  # [1, 1, D, H, W]
+        raw = session.run(None, {input_name: x})[0]  # [1, C, D, H, W] or [1, 1, D, H, W]
+        if raw.shape[1] > 1:
+            mask = raw[0].argmax(axis=0).astype(np.uint8)
+        else:
+            mask = (raw[0, 0] > 0.5).astype(np.uint8)
+        out = output_dir / "prediction.nii.gz"
+        nib.save(nib.Nifti1Image(mask, img.affine), str(out))
+        return out, []
+
+    return run
+
+
+def _make_torch_runner(model_path: str, model_info: dict):
+    import torch
+
+    obj = torch.load(model_path, map_location="cpu", weights_only=False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if isinstance(obj, torch.nn.Module):
+        model = obj.to(device).eval()
+    else:
+        raise RuntimeError(
+            f"Checkpoint at {model_path} is a state dict, not a full nn.Module. "
+            "Wrap it in your model class before registering."
+        )
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+        img = nib.load(str(input_path))
+        data = np.asarray(img.dataobj, dtype=np.float32)
+        lo, hi = data.min(), data.max()
+        data = (data - lo) / (hi - lo + 1e-8)
+        x = torch.from_numpy(data[np.newaxis, np.newaxis]).to(device)  # [1, 1, D, H, W]
+        with torch.no_grad():
+            raw = model(x)
+        raw = raw.cpu().numpy()
+        if raw.shape[1] > 1:
+            mask = raw[0].argmax(axis=0).astype(np.uint8)
+        else:
+            mask = (raw[0, 0] > 0.5).astype(np.uint8)
+        out = output_dir / "prediction.nii.gz"
+        nib.save(nib.Nifti1Image(mask, img.affine), str(out))
+        return out, []
+
+    return run
+
+
+def _make_safetensors_runner(paths: dict[str, str], model_info: dict):
+    if "config.json" not in paths:
+        raise RuntimeError(
+            "SafeTensors models require a config.json to determine the architecture. "
+            "Re-register with: python AddModel.py model.safetensors config.json"
+        )
+
+    from transformers import AutoConfig, AutoModelForSemanticSegmentation
+
+    config_dir = str(Path(paths["config.json"]).parent)
+    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+
+    try:
+        model = AutoModelForSemanticSegmentation.from_pretrained(config_dir).to(device).eval()
+    except Exception:
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(config_dir).to(device).eval()
+
+    import torch
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+        img = nib.load(str(input_path))
+        data = np.asarray(img.dataobj, dtype=np.float32)
+        lo, hi = data.min(), data.max()
+        data = (data - lo) / (hi - lo + 1e-8)
+        x = torch.from_numpy(data[np.newaxis, np.newaxis]).to(device)
+        with torch.no_grad():
+            out = model(pixel_values=x)
+        logits = out.logits.cpu().numpy()
+        if logits.shape[1] > 1:
+            mask = logits[0].argmax(axis=0).astype(np.uint8)
+        else:
+            mask = (logits[0, 0] > 0.5).astype(np.uint8)
+        out_path = output_dir / "prediction.nii.gz"
+        nib.save(nib.Nifti1Image(mask, img.affine), str(out_path))
+        return out_path, []
+
+    return run
+
+
+def _make_monai_unet_runner(model_path: str, model_info: dict):
+    import torch
+    from monai.networks.nets import UNet
+
+    model = UNet(
+        spatial_dims=model_info.get("spatial_dims", 3),
+        in_channels=model_info.get("in_channels", 1),
+        out_channels=model_info.get("out_channels", 2),
+        channels=model_info.get("channels", (16, 32, 64, 128, 256)),
+        strides=model_info.get("strides", (2, 2, 2, 2)),
+        num_res_units=model_info.get("num_res_units", 2),
+        norm=model_info.get("norm", "batch"),
+    )
+    sd = torch.load(model_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(sd)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device).eval()
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+        import torch as _torch
+        img = nib.load(str(input_path))
+        data = np.asarray(img.dataobj, dtype=np.float32)
+        lo, hi = data.min(), data.max()
+        data = (data - lo) / (hi - lo + 1e-8)
+        x = _torch.from_numpy(data[np.newaxis, np.newaxis]).to(device)
+        with _torch.no_grad():
+            raw = model(x)
+        raw = raw.cpu().numpy()
+        if raw.shape[1] > 1:
+            mask = raw[0].argmax(axis=0).astype(np.uint8)
+        else:
+            mask = (raw[0, 0] > 0.5).astype(np.uint8)
+        out = output_dir / "prediction.nii.gz"
+        nib.save(nib.Nifti1Image(mask, img.affine), str(out))
+        return out, []
+
+    return run
+
+
+_RUNNER_FACTORIES = {
+    "onnx": _make_onnx_runner,
+    "torch": _make_torch_runner,
+    "monai_unet": _make_monai_unet_runner,
+    "safetensors": _make_safetensors_runner,
+}
+
+
+def load_registered_models() -> None:
+    """Read models_registry.json and register each entry into _runners / _model_meta."""
+    if not REGISTRY_FILE.exists():
+        return
+
+    global _registry_active
+    registry = json.loads(REGISTRY_FILE.read_text())
+    _registry_model_ids.clear()
+    if registry.get("models"):
+        _registry_active = True
+    for entry in registry.get("models", []):
+        model_id = entry["id"]
+        fmt = entry["format"]
+        paths = entry["paths"]
+
+        factory = _RUNNER_FACTORIES.get(fmt)
+        if factory is None:
+            print(f"[registry] Unknown format '{fmt}' for model '{model_id}' — skipped")
+            continue
+
+        try:
+            if fmt == "safetensors":
+                runner = factory(paths, entry.get("model_info", {}))
+            else:
+                runner = factory(paths["model"], entry.get("model_info", {}))
+        except Exception as exc:
+            print(f"[registry] Failed to load '{model_id}': {exc}")
+            continue
+
+        _runners[model_id] = runner
+        _model_meta[model_id] = {
+            "id": model_id,
+            "name": entry["name"],
+            "description": entry["description"],
+            "modality": entry["modality"],
             "endpoint": "/predict",
-            "weights": weights_name,
-            "accepts_labels": accepts_labels,
+            "weights": model_id,
+            "accepts_labels": entry.get("accepts_labels", False),
             "labels": [],
         }
-        return fn
-    return decorator
-
-
-# ---------------------------------------------------------------------------
-# TotalSegmentator
-# ---------------------------------------------------------------------------
-
-@register_model(
-    "totalsegmentator_v2",
-    id="totalsegmentator",
-    name="TotalSegmentator",
-    description="104-structure CT segmentation (fast mode)",
-    modality=["CT"],
-    accepts_labels=False,
-)
-def run_totalsegmentator(input_path: Path, output_dir: Path, labels_path: Path | None):
-    """Run TotalSegmentator on input NIfTI, return combined mask + label map."""
-    from totalsegmentator.python_api import totalsegmentator
-
-    totalsegmentator(input_path, output_dir, fast=True)
-
-    mask_files = sorted(output_dir.glob("*.nii.gz"))
-    if not mask_files:
-        raise RuntimeError("TotalSegmentator produced no output files")
-
-    ref_img = nib.load(str(mask_files[0]))
-    shape = ref_img.shape[:3]
-    affine = ref_img.affine
-    combined = np.zeros(shape, dtype=np.uint8)
-    labels = []
-
-    STRUCTURE_COLORS = {
-        "spleen": "#8b0000",
-        "kidney_right": "#2e8b57",
-        "kidney_left": "#228b22",
-        "liver": "#daa520",
-        "stomach": "#ff69b4",
-        "aorta": "#ff0000",
-        "pancreas": "#ffa500",
-        "lung_upper_lobe_left": "#4682b4",
-        "lung_lower_lobe_left": "#5f9ea0",
-        "lung_upper_lobe_right": "#6495ed",
-        "lung_middle_lobe_right": "#7b68ee",
-        "lung_lower_lobe_right": "#87ceeb",
-        "heart": "#dc143c",
-        "gallbladder": "#32cd32",
-        "esophagus": "#ff8c00",
-        "trachea": "#00ced1",
-        "small_bowel": "#f0e68c",
-        "colon": "#bdb76b",
-        "urinary_bladder": "#9370db",
-    }
-
-    for i, mask_file in enumerate(mask_files):
-        label_val = i + 1
-        if label_val > 255:
-            break
-
-        structure_name = mask_file.stem.replace(".nii", "")
-        img = nib.load(str(mask_file))
-        data = np.asarray(img.dataobj)
-        combined[data > 0] = label_val
-        color = STRUCTURE_COLORS.get(structure_name, _default_color(label_val))
-        labels.append({"value": label_val, "name": structure_name, "color": color})
-
-    combined_path = output_dir / "combined_mask.nii.gz"
-    combined_img = nib.Nifti1Image(combined, affine)
-    combined_img.set_data_dtype(np.uint8)
-    nib.save(combined_img, str(combined_path))
-
-    return combined_path, labels
-
-
-# ---------------------------------------------------------------------------
-# mhub Docker runner (generic template for containerised models)
-# ---------------------------------------------------------------------------
-
-@register_model(
-    "mhub_docker",
-    id="mhub-docker",
-    name="mhub Docker",
-    description="Generic mhub.ai Docker container runner",
-    modality=[],
-    accepts_labels=False,
-)
-def run_mhub_docker(
-    input_path: Path,
-    output_dir: Path,
-    labels_path: Path | None,
-    docker_image: str = "mhubai/totalsegmentator",
-):
-    """Run an mhub.ai Docker container for inference."""
-    import subprocess
-
-    input_mount = input_path.parent
-    cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
-        "-v", f"{input_mount}:/input:ro",
-        "-v", f"{output_dir}:/output",
-        docker_image,
-        "--input", f"/input/{input_path.name}",
-        "--output", "/output/output.nii.gz",
-    ]
-
-    if labels_path:
-        labels_mount = labels_path.parent
-        cmd.extend(["-v", f"{labels_mount}:/labels:ro"])
-        cmd.extend(["--labels", f"/labels/{labels_path.name}"])
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(f"Docker failed: {result.stderr[:500]}")
-
-    output_mask = output_dir / "output.nii.gz"
-    if not output_mask.exists():
-        niftis = list(output_dir.glob("*.nii.gz"))
-        if niftis:
-            output_mask = niftis[0]
-        else:
-            raise RuntimeError("Docker container produced no output")
-
-    return output_mask, []
-
-
-# ---------------------------------------------------------------------------
-# Refine segmentation (placeholder — pass-through until real model added)
-# ---------------------------------------------------------------------------
-
-@register_model(
-    "refine_v1",
-    id="refine-seg",
-    name="Refine Segmentation",
-    description="Refines existing label boundaries using image features",
-    modality=[],
-    accepts_labels=True,
-)
-def run_refine(input_path: Path, output_dir: Path, labels_path: Path | None):
-    """Placeholder: refine existing segmentation. Replace with real model."""
-    if not labels_path or not labels_path.exists():
-        raise RuntimeError("Refine model requires existing labels as input")
-
-    output_path = output_dir / "refined.nii.gz"
-    shutil.copy2(labels_path, output_path)
-    return output_path, []
+        _registry_model_ids.add(model_id)
+        print(f"[registry] Loaded '{model_id}' ({fmt})")
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +246,8 @@ def run_refine(input_path: Path, output_dir: Path, labels_path: Path | None):
 async def list_models():
     """Return the list of available AI models with their metadata.
 
-    SIGMA calls this on startup and when the user opens the AI panel.
+    Returns only registry-loaded models when the registry has entries,
+    so built-in placeholders don't appear alongside user-registered models.
     """
     return list(_model_meta.values())
 
@@ -278,6 +312,13 @@ async def predict(
         )
 
 
+@app.post("/models/reload")
+async def reload_models():
+    """Re-read models_registry.json and load any newly registered models."""
+    load_registered_models()
+    return {"loaded": list(_runners.keys())}
+
+
 @app.get("/health")
 async def health():
     """Health check — reports GPU status and available models."""
@@ -306,21 +347,15 @@ async def health():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _default_color(idx: int) -> str:
-    colors = [
-        "#ff0000", "#00ff00", "#0000ff", "#ffff00", "#00ffff", "#ff00ff",
-        "#ff8800", "#8800ff", "#00ff88", "#ff0088", "#0088ff", "#88ff00",
-        "#cc4444", "#44cc44", "#4444cc", "#cccc44", "#44cccc", "#cc44cc",
-    ]
-    return colors[idx % len(colors)]
 
 
 def main():
     parser = argparse.ArgumentParser(description="SigmaServer — AI Inference")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
 
+    load_registered_models()
     print(f"Registered models: {[m['id'] for m in _model_meta.values()]}")
     print(f"Starting SigmaServer on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
