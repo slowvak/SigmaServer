@@ -202,14 +202,14 @@ _RUNNER_FACTORIES = {
 def _totalsegmentator_device() -> tuple[str, bool]:
     """Return (device, use_fast) suited to the current platform.
 
-    macOS: MPS when available (Apple Silicon), else CPU; always fast=True because
-    MPS/CPU can't run the 1.5 mm model in reasonable time.
+    macOS: always CPU + fast=True. MPS (Apple Silicon GPU) is NOT used because
+    nnU-Net has incomplete MPS support — unsupported ops fall back silently and
+    NaN values propagate through the network, producing an all-zero output mask.
     Other: gpu when CUDA is available, else CPU; fast=False (full 1.5 mm model).
     """
-    import torch
     if sys.platform == "darwin":
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        return device, True
+        return "cpu", True
+    import torch
     device = "gpu" if torch.cuda.is_available() else "cpu"
     return device, False
 
@@ -225,14 +225,17 @@ def _get_totalsegmentator_labels(task: str) -> list[dict]:
     """Return [{value, name, color}] label objects for each non-background class."""
     try:
         from totalsegmentator.map_to_binary import class_map
+        print(f"[TotalSeg] class_map keys: {list(class_map.keys())}")
         mapping: dict[int, str] = class_map.get(task, {})
+        print(f"[TotalSeg] task='{task}' → {len(mapping)} label entries")
         if not mapping:
             return []
         return [
             {"value": idx, "name": name, "color": _label_color(idx)}
             for idx, name in sorted(mapping.items())
         ]
-    except Exception:
+    except Exception as e:
+        print(f"[TotalSeg] _get_totalsegmentator_labels error: {e}")
         return []
 
 
@@ -242,8 +245,17 @@ def _make_totalsegmentator_runner(task: str):
 
     def run(input_path: Path, output_dir: Path, labels_path: Path | None):
         input_img = nib.load(str(input_path))
+        in_data = np.asarray(input_img.dataobj)
+        print(f"[TotalSeg] Input shape={input_img.shape} dtype={in_data.dtype} "
+              f"range=[{in_data.min():.0f}, {in_data.max():.0f}] non-zero={np.count_nonzero(in_data)}")
         output_img = _ts(input_img, task=task, ml=True, verbose=False,
                          device=device, fast=use_fast)
+        if output_img is None:
+            print("[TotalSeg] ERROR: _ts returned None")
+        else:
+            out_data = np.asarray(output_img.dataobj)
+            print(f"[TotalSeg] Output shape={output_img.shape} dtype={out_data.dtype} "
+                  f"non-zero={np.count_nonzero(out_data)} unique={np.unique(out_data).tolist()[:10]}")
         out_path = output_dir / "prediction.nii.gz"
         nib.save(output_img, str(out_path))
         return out_path, _get_totalsegmentator_labels(task)
