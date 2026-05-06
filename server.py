@@ -16,6 +16,7 @@ config.json: { "ai": { "server": "http://<this-machine>:8050" } }
 """
 
 import argparse
+import asyncio
 import json
 import sys
 import tempfile
@@ -28,6 +29,36 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import Response
 
 REGISTRY_FILE = Path(__file__).parent / "models_registry.json"
+
+# ---------------------------------------------------------------------------
+# Live inference progress — patched directly into tqdm.update at startup
+# ---------------------------------------------------------------------------
+
+_live_progress: dict = {"pct": 0, "phase": "idle"}
+
+
+def _install_tqdm_hook() -> None:
+    """Patch tqdm.tqdm.update so every progress step updates _live_progress.
+
+    Patching the method on the class (rather than replacing the class or
+    redirecting stderr) works regardless of how each module imported tqdm.
+    """
+    try:
+        import tqdm as _tqdm_mod
+        _orig = _tqdm_mod.tqdm.update
+
+        def _update(self, n=1):
+            result = _orig(self, n)
+            total = getattr(self, "total", None)
+            if total:
+                _live_progress["pct"] = min(99, int(100 * self.n / total))
+                _live_progress["phase"] = "running"
+            return result
+
+        _tqdm_mod.tqdm.update = _update
+        print("[SigmaServer] tqdm progress hook installed")
+    except Exception as exc:
+        print(f"[SigmaServer] Could not install tqdm hook: {exc}")
 _registry_model_ids: set[str] = set()
 _registry_active: bool = False  # True once registry file with entries is found
 
@@ -241,21 +272,29 @@ def _get_totalsegmentator_labels(task: str) -> list[dict]:
 
 def _make_totalsegmentator_runner(task: str):
     from totalsegmentator.python_api import totalsegmentator as _ts
-    device, use_fast = _totalsegmentator_device()
+    device, platform_fast = _totalsegmentator_device()
 
-    def run(input_path: Path, output_dir: Path, labels_path: Path | None):
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None, fast: bool | None = None):
+        use_fast = platform_fast if fast is None else fast
         input_img = nib.load(str(input_path))
         in_data = np.asarray(input_img.dataobj)
         print(f"[TotalSeg] Input shape={input_img.shape} dtype={in_data.dtype} "
-              f"range=[{in_data.min():.0f}, {in_data.max():.0f}] non-zero={np.count_nonzero(in_data)}")
-        output_img = _ts(input_img, task=task, ml=True, verbose=False,
+              f"range=[{in_data.min():.0f}, {in_data.max():.0f}] non-zero={np.count_nonzero(in_data)}"
+              f" fast={use_fast}")
+
+        _live_progress["pct"] = 0
+        _live_progress["phase"] = "running"
+        output_img = _ts(input_img, task=task, ml=True, verbose=True,
                          device=device, fast=use_fast)
+
         if output_img is None:
             print("[TotalSeg] ERROR: _ts returned None")
         else:
             out_data = np.asarray(output_img.dataobj)
             print(f"[TotalSeg] Output shape={output_img.shape} dtype={out_data.dtype} "
                   f"non-zero={np.count_nonzero(out_data)} unique={np.unique(out_data).tolist()[:10]}")
+        _live_progress["pct"] = 100
+        _live_progress["phase"] = "done"
         out_path = output_dir / "prediction.nii.gz"
         nib.save(output_img, str(out_path))
         return out_path, _get_totalsegmentator_labels(task)
@@ -352,6 +391,12 @@ def load_registered_models() -> None:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/progress")
+async def get_progress():
+    """Return the current inference progress as {pct: 0-100, phase: str}."""
+    return _live_progress
+
+
 @app.get("/models")
 async def list_models():
     """Return the list of available AI models with their metadata.
@@ -367,6 +412,7 @@ async def predict(
     image: UploadFile = File(...),
     weights: str = Form(""),
     labels: UploadFile | None = File(None),
+    fast: str = Form(""),
 ):
     """Run model inference on a NIfTI volume.
 
@@ -402,7 +448,10 @@ async def predict(
         output_dir.mkdir()
 
         try:
-            mask_path, label_map = _runners[weights](input_path, output_dir, labels_path)
+            fast_flag = True if fast == "true" else (False if fast == "false" else None)
+            mask_path, label_map = await asyncio.to_thread(
+                _runners[weights], input_path, output_dir, labels_path, fast=fast_flag
+            )
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -478,6 +527,7 @@ def main():
     parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
 
+    _install_tqdm_hook()
     load_builtin_models()
     load_registered_models()
     print(f"Registered models: {[m['id'] for m in _model_meta.values()]}")
