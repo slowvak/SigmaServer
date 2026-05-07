@@ -5,6 +5,8 @@ Loads models once at startup and exposes them via HTTP API.
 
 Endpoints:
     GET  /models         — list available AI tools with metadata
+    POST /models/upload  — upload and register a custom model file
+    POST /models/reload  — reload models_registry.json without restart
     POST /predict        — run model inference on a NIfTI volume
     GET  /health         — health check + GPU info
 
@@ -25,7 +27,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 REGISTRY_FILE = Path(__file__).parent / "models_registry.json"
@@ -469,6 +471,93 @@ async def predict(
             media_type="application/gzip",
             headers=headers,
         )
+
+
+@app.post("/models/upload")
+async def upload_model(
+    file: UploadFile = File(...),
+    config: UploadFile | None = File(None),
+    name: str = Form(None),
+    description: str = Form(""),
+):
+    """Upload and register a custom model.
+
+    Accepted formats: .pth/.pt (full PyTorch nn.Module), .onnx, .safetensors.
+    SafeTensors requires a config.json uploaded alongside it.
+    Saves files to models/<id>/, updates models_registry.json, loads immediately.
+    """
+    _EXT_TO_FMT = {".onnx": "onnx", ".pth": "torch", ".pt": "torch", ".safetensors": "safetensors"}
+
+    suffix = Path(file.filename).suffix.lower()
+    fmt = _EXT_TO_FMT.get(suffix)
+    if not fmt:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {suffix}. Accepted: .pth, .pt, .onnx, .safetensors",
+        )
+
+    if fmt == "safetensors" and config is None:
+        raise HTTPException(status_code=400, detail="SafeTensors models require a config.json")
+
+    stem = Path(file.filename).stem
+    model_id = stem.replace(" ", "-").lower()
+    display_name = name or stem
+
+    models_dir = Path(__file__).parent / "models" / model_id
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = models_dir / file.filename
+    model_path.write_bytes(await file.read())
+
+    paths: dict[str, str] = (
+        {file.filename: str(model_path)} if fmt == "safetensors" else {"model": str(model_path)}
+    )
+
+    if config is not None:
+        config_path = models_dir / "config.json"
+        config_path.write_bytes(await config.read())
+        paths["config.json"] = str(config_path)
+
+    entry = {
+        "id": model_id,
+        "name": display_name,
+        "description": description,
+        "modality": [],
+        "format": fmt,
+        "paths": paths,
+        "accepts_labels": False,
+        "model_info": {},
+    }
+
+    registry_data = json.loads(REGISTRY_FILE.read_text()) if REGISTRY_FILE.exists() else {"models": []}
+    registry_data["models"] = [m for m in registry_data["models"] if m["id"] != model_id]
+    registry_data["models"].append(entry)
+    REGISTRY_FILE.write_text(json.dumps(registry_data, indent=2) + "\n")
+
+    factory = _RUNNER_FACTORIES[fmt]
+    try:
+        if fmt == "safetensors":
+            runner = await asyncio.to_thread(factory, paths, {})
+        else:
+            runner = await asyncio.to_thread(factory, paths["model"], {})
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Model saved but failed to load: {exc}")
+
+    _runners[model_id] = runner
+    meta = {
+        "id": model_id,
+        "name": display_name,
+        "description": description,
+        "modality": [],
+        "endpoint": "/predict",
+        "weights": model_id,
+        "accepts_labels": False,
+        "labels": [],
+    }
+    _model_meta[model_id] = meta
+    _registry_model_ids.add(model_id)
+    print(f"[upload] Registered '{display_name}' (id={model_id}, fmt={fmt})")
+    return meta
 
 
 @app.post("/models/reload")
