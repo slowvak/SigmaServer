@@ -116,7 +116,7 @@ def _infer_monai_unet_arch(state_dict: dict) -> dict | None:
     import re
 
     # Unwrap Lightning / other checkpoint wrappers that nest weights under a key
-    for nest_key in ("state_dict", "model_state_dict", "model"):
+    for nest_key in ("state_dict", "model_state_dict", "network_weights", "model"):
         if nest_key in state_dict and isinstance(state_dict.get(nest_key), dict):
             state_dict = state_dict[nest_key]
             break
