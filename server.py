@@ -187,6 +187,92 @@ def _infer_monai_unet_arch(state_dict: dict) -> dict | None:
     return arch
 
 
+def _make_nnunet_runner(model_path: str, model_info: dict):
+    """Build a runner for nnU-Net v2 checkpoints using the embedded plans."""
+    import json
+    import shutil
+    import tempfile
+    import torch
+
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    init_args = ckpt.get("init_args", {})
+    trainer_name = ckpt.get("trainer_name", "unknown")
+
+    if not isinstance(init_args, dict):
+        raise RuntimeError(f"nnU-Net init_args has unexpected type: {type(init_args).__name__}")
+
+    plans = init_args.get("plans")
+    dataset_json = init_args.get("dataset_json")
+    configuration = init_args.get("configuration", "3d_fullres")
+    print(f"[nnunet] trainer={trainer_name} configuration={configuration}")
+
+    if plans is None:
+        raise RuntimeError(
+            f"nnU-Net checkpoint missing 'plans' in init_args. "
+            f"init_args keys: {list(init_args.keys())}"
+        )
+
+    try:
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    except ImportError:
+        raise RuntimeError("nnU-Net v2 is not installed — cannot load this checkpoint.")
+
+    def _to_json(obj):
+        if hasattr(obj, "__class__") and "device" in type(obj).__name__.lower():
+            return str(obj)
+        raise TypeError(f"Not serializable: {type(obj)}")
+
+    # Build a temporary model folder that nnUNetPredictor expects
+    tmpdir = Path(tempfile.mkdtemp(prefix="sigma_nnunet_"))
+    (tmpdir / "plans.json").write_text(json.dumps(plans, default=_to_json))
+    (tmpdir / "dataset.json").write_text(json.dumps(
+        dataset_json or {
+            "channel_names": {"0": "CT"},
+            "labels": {"background": 0, "foreground": 1},
+            "numTraining": 0,
+            "file_ending": ".nii.gz",
+        },
+        default=_to_json,
+    ))
+    fold_dir = tmpdir / "fold_0"
+    fold_dir.mkdir()
+    shutil.copy2(model_path, fold_dir / "checkpoint_final.pth")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=False,
+        perform_everything_on_device=device.type != "cpu",
+        device=device,
+        verbose=True,
+    )
+    predictor.initialize_from_trained_model_folder(
+        str(tmpdir),
+        use_folds=(0,),
+        checkpoint_name="checkpoint_final.pth",
+    )
+    print(f"[nnunet] Loaded successfully from {model_path}")
+
+    def run(input_path: Path, output_dir: Path, labels_path: Path | None, **_):
+        out_stub = str(output_dir / "pred")
+        predictor.predict_from_files(
+            [[str(input_path)]],
+            [out_stub],
+            save_probabilities=False,
+            overwrite=True,
+            num_processes_preprocessing=1,
+            num_processes_segmentation_export=1,
+        )
+        result = output_dir / "pred.nii.gz"
+        out = output_dir / "prediction.nii.gz"
+        if result.exists():
+            result.rename(out)
+        return out, []
+
+    return run
+
+
 def _make_torch_runner(model_path: str, model_info: dict):
     import torch
 
@@ -196,6 +282,9 @@ def _make_torch_runner(model_path: str, model_info: dict):
     if isinstance(obj, torch.nn.Module):
         model = obj.to(device).eval()
     elif isinstance(obj, dict):
+        # nnU-Net v2 checkpoint: has network_weights + trainer_name + init_args
+        if "network_weights" in obj and "trainer_name" in obj:
+            return _make_nnunet_runner(model_path, model_info)
         inferred = _infer_monai_unet_arch(obj)
         if inferred:
             return _make_monai_unet_runner(model_path, inferred)
@@ -203,7 +292,7 @@ def _make_torch_runner(model_path: str, model_info: dict):
         print(f"[upload] Unrecognized checkpoint. Top-level keys: {sample_keys}")
         raise RuntimeError(
             f"Unrecognized checkpoint format. Top-level keys: {sample_keys}. "
-            "Supported auto-detection: MONAI UNet state dicts and Lightning checkpoints."
+            "Supported: full nn.Module, MONAI UNet state dict, nnU-Net v2, Lightning checkpoints."
         )
     else:
         raise RuntimeError(f"Unexpected checkpoint type: {type(obj)}")
