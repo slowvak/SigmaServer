@@ -107,6 +107,81 @@ def _make_onnx_runner(model_path: str, model_info: dict):
     return run
 
 
+def _infer_monai_unet_arch(state_dict: dict) -> dict | None:
+    """Read weight shapes from a MONAI UNet state dict to reconstruct its architecture.
+
+    Handles an optional wrapper prefix (e.g. DataParallel 'module.' or a custom
+    outer module like 'net.') by scanning for the MONAI key pattern regardless of
+    what precedes it.
+    """
+    import re
+
+    # Find the prefix that precedes "model.{N}.conv.unit0.conv.weight"
+    prefix = None
+    for k in state_dict:
+        m = re.match(r"^(.*?)model\.\d+\.conv\.unit0\.conv\.weight$", k)
+        if m:
+            prefix = m.group(1)
+            break
+    if prefix is None:
+        return None
+
+    # Build a prefix-stripped view
+    stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+
+    # Collect encoder levels: model.{N}.conv.unit0.conv.weight
+    encoder: dict[int, object] = {}
+    for k, v in stripped.items():
+        m = re.match(r"^model\.(\d+)\.conv\.unit0\.conv\.weight$", k)
+        if m:
+            encoder[int(m.group(1))] = v
+    if not encoder:
+        return None
+
+    sorted_idxs = sorted(encoder.keys())
+    first_w = encoder[sorted_idxs[0]]
+
+    # spatial_dims from conv weight rank: shape is [out, in, *kernel]
+    spatial_dims = len(first_w.shape) - 2
+    if spatial_dims not in (2, 3):
+        return None
+
+    in_channels  = int(first_w.shape[1])
+    channels     = [int(encoder[i].shape[0]) for i in sorted_idxs]
+    strides      = [2] * (len(channels) - 1)
+
+    # out_channels from the last model level's first conv output
+    all_idxs = set()
+    for k in stripped:
+        m = re.match(r"^model\.(\d+)\.", k)
+        if m:
+            all_idxs.add(int(m.group(1)))
+    last_idx  = max(all_idxs)
+    last_unit = stripped.get(f"model.{last_idx}.conv.unit0.conv.weight")
+    out_channels = int(last_unit.shape[0]) if last_unit is not None else 2
+
+    # num_res_units from how many unit{N} keys exist per encoder level
+    max_unit_idx = 0
+    for k in stripped:
+        m = re.match(r"^model\.\d+\.conv\.unit(\d+)\.conv\.weight$", k)
+        if m:
+            max_unit_idx = max(max_unit_idx, int(m.group(1)))
+    num_res_units = max_unit_idx
+
+    arch = {
+        "format": "monai_unet",
+        "spatial_dims": spatial_dims,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "channels": channels,
+        "strides": strides,
+        "num_res_units": num_res_units,
+        "_key_prefix": prefix,  # stored so load_state_dict can strip it
+    }
+    print(f"[upload] Auto-detected MONAI UNet arch from state dict: {arch}")
+    return arch
+
+
 def _make_torch_runner(model_path: str, model_info: dict):
     import torch
 
@@ -115,11 +190,19 @@ def _make_torch_runner(model_path: str, model_info: dict):
 
     if isinstance(obj, torch.nn.Module):
         model = obj.to(device).eval()
-    else:
+    elif isinstance(obj, dict):
+        inferred = _infer_monai_unet_arch(obj)
+        if inferred:
+            return _make_monai_unet_runner(model_path, inferred)
+        sample_keys = list(obj.keys())[:5]
         raise RuntimeError(
-            f"Checkpoint at {model_path} is a state dict, not a full nn.Module. "
-            "Wrap it in your model class before registering."
+            f"Checkpoint is a state dict with unrecognized architecture. "
+            f"Sample keys: {sample_keys}. "
+            "Supported auto-detection: MONAI UNet. "
+            "For other architectures use AddModel.py."
         )
+    else:
+        raise RuntimeError(f"Unexpected checkpoint type: {type(obj)}")
 
     def run(input_path: Path, output_dir: Path, labels_path: Path | None):
         img = nib.load(str(input_path))
@@ -195,6 +278,10 @@ def _make_monai_unet_runner(model_path: str, model_info: dict):
         norm=model_info.get("norm", "batch"),
     )
     sd = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict):
+        prefix = model_info.get("_key_prefix", "")
+        if prefix:
+            sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
     model.load_state_dict(sd)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
