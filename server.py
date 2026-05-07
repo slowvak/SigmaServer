@@ -482,9 +482,12 @@ async def upload_model(
 ):
     """Upload and register a custom model.
 
-    Accepted formats: .pth/.pt (full PyTorch nn.Module), .onnx, .safetensors.
-    SafeTensors requires a config.json uploaded alongside it.
-    Saves files to models/<id>/, updates models_registry.json, loads immediately.
+    Accepted formats: .pth/.pt, .onnx, .safetensors.
+    - .safetensors requires a HuggingFace config.json alongside it.
+    - .pth/.pt state dicts require a model config JSON with a "format" key
+      (e.g. {"format":"monai_unet","spatial_dims":3,"in_channels":1,"out_channels":2,
+              "channels":[16,32,64,128,256],"strides":[2,2,2,2]}).
+      Full nn.Module checkpoints load without a config.
     """
     _EXT_TO_FMT = {".onnx": "onnx", ".pth": "torch", ".pt": "torch", ".safetensors": "safetensors"}
 
@@ -513,10 +516,23 @@ async def upload_model(
         {file.filename: str(model_path)} if fmt == "safetensors" else {"model": str(model_path)}
     )
 
+    model_info: dict = {}
     if config is not None:
+        config_bytes = await config.read()
         config_path = models_dir / "config.json"
-        config_path.write_bytes(await config.read())
+        config_path.write_bytes(config_bytes)
         paths["config.json"] = str(config_path)
+
+        # For torch state dicts, the JSON may specify architecture via "format"
+        if fmt == "torch":
+            try:
+                arch = json.loads(config_bytes)
+                arch_fmt = arch.get("format")
+                if arch_fmt in _RUNNER_FACTORIES:
+                    fmt = arch_fmt
+                    model_info = arch
+            except Exception:
+                pass
 
     entry = {
         "id": model_id,
@@ -526,7 +542,7 @@ async def upload_model(
         "format": fmt,
         "paths": paths,
         "accepts_labels": False,
-        "model_info": {},
+        "model_info": model_info,
     }
 
     registry_data = json.loads(REGISTRY_FILE.read_text()) if REGISTRY_FILE.exists() else {"models": []}
@@ -537,11 +553,23 @@ async def upload_model(
     factory = _RUNNER_FACTORIES[fmt]
     try:
         if fmt == "safetensors":
-            runner = await asyncio.to_thread(factory, paths, {})
+            runner = await asyncio.to_thread(factory, paths, model_info)
         else:
-            runner = await asyncio.to_thread(factory, paths["model"], {})
+            runner = await asyncio.to_thread(factory, paths["model"], model_info)
+    except RuntimeError as exc:
+        if "state dict" in str(exc):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This .pth file is a state dict — the model architecture must be specified. "
+                    "Upload the .pth together with a JSON file containing the architecture, e.g.: "
+                    '{"format":"monai_unet","spatial_dims":3,"in_channels":1,"out_channels":2,'
+                    '"channels":[16,32,64,128,256],"strides":[2,2,2,2]}'
+                ),
+            )
+        raise HTTPException(status_code=422, detail=f"Model failed to load: {exc}")
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Model saved but failed to load: {exc}")
+        raise HTTPException(status_code=422, detail=f"Model failed to load: {exc}")
 
     _runners[model_id] = runner
     meta = {
