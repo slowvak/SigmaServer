@@ -214,10 +214,21 @@ def _make_nnunet_runner(model_path: str, model_info: dict):
 
     try:
         import os as _os
-        _os.environ.setdefault("nnUNet_raw", "/tmp/nnunet_raw")
-        _os.environ.setdefault("nnUNet_preprocessed", "/tmp/nnunet_preprocessed")
-        _os.environ.setdefault("nnUNet_results", "/tmp/nnunet_results")
+        # Point nnunetv2 at TotalSegmentator's results dir, which is a valid nnunetv2
+        # results tree. /tmp/... dummies cause Dataset297-not-found errors because
+        # dataset_name_id_conversion.py caches these paths at import time; once TS's
+        # setup_nnunet() later updates os.environ, the frozen local bindings don't follow.
+        _ts_results = str(Path.home() / ".totalsegmentator" / "nnunet" / "results")
+        Path(_ts_results).mkdir(parents=True, exist_ok=True)
+        _os.environ.setdefault("nnUNet_raw", _ts_results)
+        _os.environ.setdefault("nnUNet_preprocessed", _ts_results)
+        _os.environ.setdefault("nnUNet_results", _ts_results)
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+        # Patch module-level bindings that were captured before env vars were set.
+        import nnunetv2.utilities.dataset_name_id_conversion as _dnid
+        _dnid.nnUNet_raw = _os.environ.get("nnUNet_raw")
+        _dnid.nnUNet_preprocessed = _os.environ.get("nnUNet_preprocessed")
+        _dnid.nnUNet_results = _os.environ.get("nnUNet_results")
     except ImportError:
         raise RuntimeError("nnU-Net v2 is not installed — cannot load this checkpoint.")
 
