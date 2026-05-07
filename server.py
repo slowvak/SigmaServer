@@ -479,6 +479,7 @@ async def upload_model(
     config: UploadFile | None = File(None),
     name: str = Form(None),
     description: str = Form(""),
+    arch: str = Form(""),
 ):
     """Upload and register a custom model.
 
@@ -526,13 +527,24 @@ async def upload_model(
         # For torch state dicts, the JSON may specify architecture via "format"
         if fmt == "torch":
             try:
-                arch = json.loads(config_bytes)
-                arch_fmt = arch.get("format")
+                arch_dict = json.loads(config_bytes)
+                arch_fmt = arch_dict.get("format")
                 if arch_fmt in _RUNNER_FACTORIES:
                     fmt = arch_fmt
-                    model_info = arch
+                    model_info = arch_dict
             except Exception:
                 pass
+
+    # Also accept architecture spec from the arch form field (no separate file needed)
+    if fmt == "torch" and arch:
+        try:
+            arch_dict = json.loads(arch)
+            arch_fmt = arch_dict.get("format")
+            if arch_fmt in _RUNNER_FACTORIES:
+                fmt = arch_fmt
+                model_info = arch_dict
+        except Exception:
+            pass
 
     entry = {
         "id": model_id,
