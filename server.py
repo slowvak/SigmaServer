@@ -213,6 +213,10 @@ def _make_nnunet_runner(model_path: str, model_info: dict):
         )
 
     try:
+        import os as _os
+        _os.environ.setdefault("nnUNet_raw", str(tmpdir / "raw"))
+        _os.environ.setdefault("nnUNet_preprocessed", str(tmpdir / "preprocessed"))
+        _os.environ.setdefault("nnUNet_results", str(tmpdir / "results"))
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
     except ImportError:
         raise RuntimeError("nnU-Net v2 is not installed — cannot load this checkpoint.")
