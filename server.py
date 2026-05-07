@@ -110,11 +110,16 @@ def _make_onnx_runner(model_path: str, model_info: dict):
 def _infer_monai_unet_arch(state_dict: dict) -> dict | None:
     """Read weight shapes from a MONAI UNet state dict to reconstruct its architecture.
 
-    Handles an optional wrapper prefix (e.g. DataParallel 'module.' or a custom
-    outer module like 'net.') by scanning for the MONAI key pattern regardless of
-    what precedes it.
+    Handles Lightning checkpoints (nested under 'state_dict' key), DataParallel
+    ('module.' prefix), and any other outer module wrapper prefix.
     """
     import re
+
+    # Unwrap Lightning / other checkpoint wrappers that nest weights under a key
+    for nest_key in ("state_dict", "model_state_dict", "model"):
+        if nest_key in state_dict and isinstance(state_dict.get(nest_key), dict):
+            state_dict = state_dict[nest_key]
+            break
 
     # Find the prefix that precedes "model.{N}.conv.unit0.conv.weight"
     prefix = None
@@ -194,12 +199,11 @@ def _make_torch_runner(model_path: str, model_info: dict):
         inferred = _infer_monai_unet_arch(obj)
         if inferred:
             return _make_monai_unet_runner(model_path, inferred)
-        sample_keys = list(obj.keys())[:5]
+        sample_keys = list(obj.keys())[:8]
+        print(f"[upload] Unrecognized checkpoint. Top-level keys: {sample_keys}")
         raise RuntimeError(
-            f"Checkpoint is a state dict with unrecognized architecture. "
-            f"Sample keys: {sample_keys}. "
-            "Supported auto-detection: MONAI UNet. "
-            "For other architectures use AddModel.py."
+            f"Unrecognized checkpoint format. Top-level keys: {sample_keys}. "
+            "Supported auto-detection: MONAI UNet state dicts and Lightning checkpoints."
         )
     else:
         raise RuntimeError(f"Unexpected checkpoint type: {type(obj)}")
@@ -279,6 +283,10 @@ def _make_monai_unet_runner(model_path: str, model_info: dict):
     )
     sd = torch.load(model_path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict):
+        for nest_key in ("state_dict", "model_state_dict", "model"):
+            if nest_key in sd and isinstance(sd.get(nest_key), dict):
+                sd = sd[nest_key]
+                break
         prefix = model_info.get("_key_prefix", "")
         if prefix:
             sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
@@ -655,18 +663,6 @@ async def upload_model(
             runner = await asyncio.to_thread(factory, paths, model_info)
         else:
             runner = await asyncio.to_thread(factory, paths["model"], model_info)
-    except RuntimeError as exc:
-        if "state dict" in str(exc):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "This .pth file is a state dict — the model architecture must be specified. "
-                    "Upload the .pth together with a JSON file containing the architecture, e.g.: "
-                    '{"format":"monai_unet","spatial_dims":3,"in_channels":1,"out_channels":2,'
-                    '"channels":[16,32,64,128,256],"strides":[2,2,2,2]}'
-                ),
-            )
-        raise HTTPException(status_code=422, detail=f"Model failed to load: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Model failed to load: {exc}")
 
