@@ -1,8 +1,20 @@
 {
   "models": [
     {
+      "id": "2d_checkpoint_best",
+      "name": "2D brain bleed",
+      "description": "",
+      "modality": [],
+      "format": "torch",
+      "paths": {
+        "model": "/Users/bje/repos/SigmaServer/models/2d_checkpoint_best/2d_checkpoint_best.pth"
+      },
+      "accepts_labels": false,
+      "model_info": {}
+    },
+    {
       "id": "3d_checkpoint_best",
-      "name": "3d_checkpoint_best",
+      "name": "3D brain bleed",
       "description": "",
       "modality": [],
       "format": "torch",

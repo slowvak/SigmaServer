@@ -604,8 +604,15 @@ async def list_models():
 
     Returns only registry-loaded models when the registry has entries,
     so built-in placeholders don't appear alongside user-registered models.
+    Each entry includes a `builtin` boolean so clients can distinguish
+    user-uploaded models from built-in ones.
     """
-    return list(_model_meta.values())
+    result = []
+    for model_id, meta in _model_meta.items():
+        entry = dict(meta)
+        entry["builtin"] = model_id not in _registry_model_ids
+        result.append(entry)
+    return result
 
 
 @app.post("/predict")
@@ -785,6 +792,31 @@ async def upload_model(
     _registry_model_ids.add(model_id)
     print(f"[upload] Registered '{display_name}' (id={model_id}, fmt={fmt})")
     return meta
+
+
+@app.delete("/models/{model_id}")
+async def delete_model(model_id: str):
+    """Unload and remove a user-uploaded model.
+
+    Built-in models (not in the registry) cannot be removed.
+    The model is removed from memory and from models_registry.json.
+    """
+    if model_id not in _model_meta:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    if model_id not in _registry_model_ids:
+        raise HTTPException(status_code=400, detail=f"Cannot remove built-in model '{model_id}'")
+
+    _runners.pop(model_id, None)
+    _model_meta.pop(model_id, None)
+    _registry_model_ids.discard(model_id)
+
+    if REGISTRY_FILE.exists():
+        registry_data = json.loads(REGISTRY_FILE.read_text())
+        registry_data["models"] = [m for m in registry_data["models"] if m["id"] != model_id]
+        REGISTRY_FILE.write_text(json.dumps(registry_data, indent=2) + "\n")
+
+    print(f"[delete] Removed model '{model_id}'")
+    return {"removed": model_id}
 
 
 @app.post("/models/reload")
