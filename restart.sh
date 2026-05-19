@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright Bradley J Erickson, 2026.
 # restart.sh — Kill any existing SigmaServer process and restart it.
 
 set -euo pipefail

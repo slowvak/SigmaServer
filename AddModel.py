@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright Bradley J Erickson, 2026.
 """AddModel — register a local model file with SigmaServer.
 
 Detects format from file extension(s), validates the model loads cleanly,

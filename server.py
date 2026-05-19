@@ -1,3 +1,4 @@
+# Copyright Bradley J Erickson, 2026.
 """SigmaServer — AI inference server for the SIGMA medical image viewer.
 
 Runs on a GPU machine (DGX Spark, cloud GPU instance, or local GPU).
