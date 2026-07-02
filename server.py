@@ -27,11 +27,21 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+import os as _os
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 
 REGISTRY_FILE = Path(__file__).parent / "models_registry.json"
+
+
+def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> str:
+    expected = _os.environ.get("SIGMASERVER_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=503, detail="SIGMASERVER_API_KEY is not configured on the server")
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+    return x_api_key
 
 # ---------------------------------------------------------------------------
 # Live inference progress — patched directly into tqdm.update at startup
@@ -195,7 +205,7 @@ def _make_nnunet_runner(model_path: str, model_info: dict):
     import tempfile
     import torch
 
-    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
     init_args = ckpt.get("init_args", {})
     trainer_name = ckpt.get("trainer_name", "unknown")
 
@@ -292,7 +302,7 @@ def _make_nnunet_runner(model_path: str, model_info: dict):
 def _make_torch_runner(model_path: str, model_info: dict):
     import torch
 
-    obj = torch.load(model_path, map_location="cpu", weights_only=False)
+    obj = torch.load(model_path, map_location="cpu", weights_only=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if isinstance(obj, torch.nn.Module):
@@ -386,7 +396,7 @@ def _make_monai_unet_runner(model_path: str, model_info: dict):
         num_res_units=model_info.get("num_res_units", 2),
         norm=model_info.get("norm", "batch"),
     )
-    sd = torch.load(model_path, map_location="cpu", weights_only=False)
+    sd = torch.load(model_path, map_location="cpu", weights_only=True)
     if isinstance(sd, dict):
         for nest_key in ("state_dict", "model_state_dict", "model"):
             if nest_key in sd and isinstance(sd.get(nest_key), dict):
@@ -622,7 +632,9 @@ async def predict(
     weights: str = Form(""),
     labels: UploadFile | None = File(None),
     fast: str = Form(""),
+    _api_key: str = Header(default=None, alias="X-API-Key"),
 ):
+    _require_api_key(_api_key)
     """Run model inference on a NIfTI volume.
 
     Args:
@@ -687,6 +699,7 @@ async def upload_model(
     name: str = Form(None),
     description: str = Form(""),
     arch: str = Form(""),
+    _api_key: str = Header(default=None, alias="X-API-Key"),
 ):
     """Upload and register a custom model.
 
@@ -697,6 +710,7 @@ async def upload_model(
               "channels":[16,32,64,128,256],"strides":[2,2,2,2]}).
       Full nn.Module checkpoints load without a config.
     """
+    _require_api_key(_api_key)
     _EXT_TO_FMT = {".onnx": "onnx", ".pth": "torch", ".pt": "torch", ".safetensors": "safetensors"}
 
     suffix = Path(file.filename).suffix.lower()
@@ -796,7 +810,8 @@ async def upload_model(
 
 
 @app.delete("/models/{model_id}")
-async def delete_model(model_id: str):
+async def delete_model(model_id: str, _api_key: str = Header(default=None, alias="X-API-Key")):
+    _require_api_key(_api_key)
     """Unload and remove a user-uploaded model.
 
     Built-in models (not in the registry) cannot be removed.
